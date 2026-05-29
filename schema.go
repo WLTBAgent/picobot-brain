@@ -14,7 +14,10 @@ type sqliteDB struct {
 }
 
 type sqliteResult struct{ res sql.Result }
-type sqliteRows struct{ rows *sql.Rows }
+type sqliteRows struct {
+	rows  *sql.Rows
+	unlock func() // called on Close to release RLock
+}
 type sqliteRow struct{ row *sql.Row }
 
 func openSQLite(path string) (*sqliteDB, error) {
@@ -44,7 +47,10 @@ func (s *sqliteDB) Query(query string, args ...any) (Rows, error) {
 		s.mu.RUnlock()
 		return nil, err
 	}
-	return &sqliteRows{rows: rows}, nil
+	return &sqliteRows{
+		rows:   rows,
+		unlock: s.mu.RUnlock,
+	}, nil
 }
 
 func (s *sqliteDB) QueryRow(query string, args ...any) Row {
@@ -60,8 +66,15 @@ func (r *sqliteResult) RowsAffected() (int64, error) { return r.res.RowsAffected
 
 func (r *sqliteRows) Next() bool         { return r.rows.Next() }
 func (r *sqliteRows) Scan(dest ...any) error { return r.rows.Scan(dest...) }
-func (r *sqliteRows) Close() error       { return r.rows.Close() }
 func (r *sqliteRows) Err() error         { return r.rows.Err() }
+func (r *sqliteRows) Close() error {
+	err := r.rows.Close()
+	if r.unlock != nil {
+		r.unlock()
+		r.unlock = nil
+	}
+	return err
+}
 
 func (r *sqliteRow) Scan(dest ...any) error { return r.row.Scan(dest...) }
 
