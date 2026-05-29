@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"math"
 	"sort"
+	"strings"
+	"unicode"
 )
 
 // rankedResult is an internal intermediate result used by the search pipeline.
@@ -16,6 +18,53 @@ type rankedResult struct {
 	Score  float64
 	Source string
 	Type   string
+}
+
+// sanitizeFTSQuery cleans a raw query string for safe use with SQLite FTS5 MATCH.
+// FTS5 has special syntax for ?, !, ", *, (, ), AND, OR, NOT, etc.
+// We strip all special characters and return a clean token-based query.
+func sanitizeFTSQuery(query string) string {
+	// Remove characters that are special in FTS5 syntax
+	special := "?!\")(*:^+-~{}|"
+	for _, ch := range special {
+		query = strings.ReplaceAll(query, string(ch), " ")
+	}
+
+	// Split into tokens, filter empty
+	fields := strings.Fields(query)
+
+	// Filter out FTS5 operators that could cause issues
+	ftsOperators := map[string]bool{
+		"AND": true, "OR": true, "NOT": true,
+		"NEAR": true, "COLUMN": true,
+	}
+
+	var clean []string
+	for _, f := range fields {
+		if ftsOperators[strings.ToUpper(f)] {
+			continue
+		}
+		// Skip tokens that are purely non-alphanumeric
+		if !hasLetterOrDigit(f) {
+			continue
+		}
+		clean = append(clean, f)
+	}
+
+	if len(clean) == 0 {
+		return ""
+	}
+
+	return strings.Join(clean, " OR ")
+}
+
+func hasLetterOrDigit(s string) bool {
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			return true
+		}
+	}
+	return false
 }
 
 // Search performs hybrid search combining FTS5 keyword search and vector similarity,
@@ -64,8 +113,14 @@ func (b *Brain) Search(ctx context.Context, query string, opts SearchOpts) ([]Se
 
 // searchFTS performs FTS5 full-text search with BM25 ranking.
 func (b *Brain) searchFTS(ctx context.Context, query string, opts SearchOpts) ([]rankedResult, error) {
+	// Sanitize query for FTS5
+	cleanQuery := sanitizeFTSQuery(query)
+	if cleanQuery == "" {
+		return nil, nil
+	}
+
 	// Build query with source/type filters
-	args := []any{query, opts.Limit * 3} // overfetch for filtering
+	args := []any{cleanQuery, opts.Limit * 3} // overfetch for filtering
 
 	rows, err := b.db.Query(`
 		SELECT p.id, p.slug, p.title, p.source_id, p.type,
