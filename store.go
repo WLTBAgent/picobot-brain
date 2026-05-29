@@ -22,6 +22,9 @@ func (b *Brain) IngestPage(ctx context.Context, page Page) (int64, error) {
 		page.Type = "note"
 	}
 
+	// Auto-create source if it doesn't exist (prevents FK violation)
+	b.db.Exec(`INSERT OR IGNORE INTO sources (id, name) VALUES (?, ?)`, page.SourceID, page.SourceID)
+
 	// Upsert: insert or update by (source_id, slug)
 	now := time.Now().UTC().Format(time.RFC3339)
 	metaJSON, _ := json.Marshal(page.Metadata)
