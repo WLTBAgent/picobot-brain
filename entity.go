@@ -26,16 +26,38 @@ var (
 
 	// Markdown structured fields: "- **Key**: Value" patterns
 	// Matches lines like: - **Name**: Josh  or  - **Company**: Acme Corp
-	markdownFieldRe = regexp.MustCompile(`(?i)^[\-\*]\s+\*\*(?:name|company|organization|project|channel|role|title|location|city|country|employer|school|university|team|group|department|product|brand|app|tool|framework|language|platform)\*\*:\s*(.+)$`)
+	markdownFieldRe = regexp.MustCompile(`(?im)^\s*[\-\*]\s+\*\*(?:name|company|organization|project|channel|role|title|location|city|country|employer|school|university|team|group|department|product|brand|app|tool|framework|language|platform|agent\s+identity)\*\*:\s*(.+)$`)
 
 	// Section headers as concept entities: "## Project X" or "### Tool Y"
 	sectionHeaderRe = regexp.MustCompile(`^#{2,3}\s+([A-Z][A-Za-z0-9\s&\-]{2,50})$`)
 
 	// Bold references in running text: **ThingName**
-	boldRefRe = regexp.MustCompile(`\*\*([A-Z][A-Za-z0-9&\s]{2,40})\*\*`)
+	// NOTE: We filter out patterns followed by ":" in the extraction logic below
+	boldRefRe = regexp.MustCompile(`\*\*([A-Z][A-Za-z0-9&]{2,40})\*\*`)
 
 	// Parenthetical descriptions: Name (Type) — like "WLTechBlog (YouTube)"
 	parenTypeRe = regexp.MustCompile(`([A-Z][A-Za-z0-9\s]{2,30})\s*\((YouTube|GitHub|Twitter|Discord|Telegram|Google|Apple|Microsoft|Amazon|AWS|Linux|Debian|Ubuntu|Go|Python|Rust|JavaScript|TypeScript)\)`)
+
+	// Common words that are NOT entities — structural labels, generic terms
+	entityStoplist = map[string]bool{
+		// Markdown field keys
+		"name": true, "channel": true, "role": true, "project": true,
+		"company": true, "organization": true, "title": true, "location": true,
+		"team": true, "group": true, "department": true, "product": true,
+		"brand": true, "app": true, "tool": true, "framework": true,
+		"language": true, "platform": true, "employer": true, "school": true,
+		"university": true, "city": true, "country": true,
+		// Structural/descriptive labels
+		"bug": true, "root cause": true, "fix applied": true, "key facts": true,
+		"the org": true, "user profile": true, "work context": true,
+		"topics of interest": true, "preferences": true,
+		// Generic descriptors from commit notes
+		"startup registration": true, "presence heartbeat": true,
+		"quiet heartbeat": true, "broadcast message detection": true,
+		"llm call hangs": true, "no model fallback": true, "no retry logic": true,
+		"sqlite read lock leak": true, "telegram http timeout with retry": true,
+		"auto-create source in ingestpage": true,
+	}
 )
 
 // ExtractEntities scans a page for entity references and creates entities/edges.
@@ -78,14 +100,53 @@ func (b *Brain) ExtractEntities(ctx context.Context, pageID int64) (int, error) 
 
 	// Extract structured markdown fields: - **Key**: Value
 	fieldMatches := markdownFieldRe.FindAllStringSubmatch(content, -1)
+	// Extract the field key from each match for type inference
+	fieldKeyRe := regexp.MustCompile(`(?i)\*\*(\w[\w\s]*?)\*\*:\s*`)
 	for _, m := range fieldMatches {
 		value := strings.TrimSpace(m[1])
+		// Strip everything after em-dash, en-dash, or " — " separator
+		if idx := strings.Index(value, " — "); idx > 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
+		if idx := strings.Index(value, " – "); idx > 0 {
+			value = strings.TrimSpace(value[:idx])
+		}
 		// Remove trailing punctuation
 		value = strings.TrimRight(value, ".,;")
 		if len(value) < 1 || len(value) > 60 {
 			continue
 		}
+		// Skip stoplisted values
+		if entityStoplist[strings.ToLower(value)] {
+			continue
+		}
+		// Use field key to infer type
 		entityType := inferEntityType(value, content)
+		// Determine the field key for better type inference
+		keyMatch := fieldKeyRe.FindStringSubmatch(m[0])
+		if len(keyMatch) > 1 {
+			fieldKey := strings.ToLower(strings.TrimSpace(keyMatch[1]))
+			switch fieldKey {
+			case "name":
+				entityType = "person"
+			case "channel", "platform":
+				entityType = "channel"
+			case "company", "organization", "employer":
+				entityType = "company"
+			case "project":
+				entityType = "project"
+			case "role", "title":
+				entityType = "role"
+			case "location", "city", "country":
+				entityType = "place"
+			case "school", "university":
+				entityType = "organization"
+			case "language", "framework", "tool", "app", "product", "brand":
+				entityType = "technology"
+			case "agent identity":
+				entityType = "agent"
+			}
+		}
 		slug := slugify(entityType) + "/" + slugify(value)
 		if _, err := b.ensureEntity(ctx, page.SourceID, value, entityType, slug, &pageID); err == nil {
 			created++
@@ -115,15 +176,29 @@ func (b *Brain) ExtractEntities(ctx context.Context, pageID int64) (int, error) 
 	}
 
 	// Extract bold references (only unique, significant ones)
-	boldMatches := boldRefRe.FindAllStringSubmatch(content, -1)
-	seen := map[string]bool{}
-	for _, m := range boldMatches {
-		name := strings.TrimSpace(m[1])
-		if seen[name] {
+	// Skip: stoplisted terms, markdown field keys (**Name**:), and already-extracted field values
+	boldMatches := boldRefRe.FindAllStringSubmatchIndex(content, -1)
+	fieldValues := map[string]bool{}
+	for _, m := range markdownFieldRe.FindAllStringSubmatch(content, -1) {
+		val := strings.TrimSpace(m[1])
+		if idx := strings.Index(val, " — "); idx > 0 {
+			val = strings.TrimSpace(val[:idx])
+		}
+		if idx := strings.Index(val, " – "); idx > 0 {
+			val = strings.TrimSpace(val[:idx])
+		}
+		fieldValues[val] = true
+	}
+	for _, loc := range boldMatches {
+		name := strings.TrimSpace(content[loc[2]:loc[3]])
+		// Skip if this is a markdown field key (followed by ":")
+		afterIdx := loc[1]
+		if afterIdx < len(content) && content[afterIdx] == ':' {
 			continue
 		}
-		seen[name] = true
-		// Skip common words and short names
+		if fieldValues[name] || entityStoplist[strings.ToLower(name)] {
+			continue
+		}
 		if len(name) < 3 {
 			continue
 		}
@@ -318,24 +393,47 @@ func (b *Brain) getEntityByID(ctx context.Context, id int64) (*Entity, error) {
 
 // inferEntityType guesses entity type from name context.
 func inferEntityType(name, content string) string {
-	lower := strings.ToLower(name + " " + content)
+	nameLower := strings.ToLower(name)
+	// Check name first — the entity itself tells us the type
 	switch {
-	case strings.Contains(lower, "company") || strings.Contains(lower, "corp") ||
-		strings.Contains(lower, "inc") || strings.Contains(lower, "llc") ||
-		strings.Contains(lower, "ltd") || strings.Contains(lower, "youtube") ||
-		strings.Contains(lower, "google") || strings.Contains(lower, "github"):
-		return "company"
-	case strings.Contains(lower, "conference") || strings.Contains(lower, "summit") ||
-		strings.Contains(lower, "meetup") || strings.Contains(lower, "event"):
-		return "event"
-	case strings.Contains(lower, "project") || strings.Contains(lower, "repo") ||
-		strings.Contains(lower, "bot") || strings.Contains(lower, "agent") ||
-		strings.Contains(lower, "framework") || strings.Contains(lower, "tool"):
-		return "project"
-	case strings.Contains(lower, "channel") || strings.Contains(lower, "video") ||
-		strings.Contains(lower, "blog") || strings.Contains(lower, "creator"):
+	case strings.Contains(nameLower, "bot") || strings.Contains(nameLower, "agent"):
+		return "agent"
+	case strings.Contains(nameLower, "youtube") || strings.Contains(nameLower, "channel") ||
+		strings.Contains(nameLower, "blog") || strings.Contains(nameLower, "video"):
 		return "channel"
-	default:
-		return "concept"
+	case strings.Contains(nameLower, "corp") || strings.Contains(nameLower, "inc") ||
+		strings.Contains(nameLower, "llc") || strings.Contains(nameLower, "ltd"):
+		return "company"
 	}
+
+	// For short names (likely proper nouns), use content context
+	if len(name) <= 30 {
+		contentLower := strings.ToLower(content)
+		// Only look for patterns near the entity name in content
+		// Check if the name appears in a markdown field that hints at type
+		namePattern := "(?i)-\\s*\\*\\*.*\\*\\*:\\s*" + regexp.QuoteMeta(name)
+		if matched, _ := regexp.MatchString(namePattern, content); matched {
+			// Look at which field key it's under
+			fieldTypeRe := regexp.MustCompile(`(?i)\*\*(name|employer|school|university)\*\*:\s*` + regexp.QuoteMeta(name))
+			if fieldTypeRe.MatchString(content) {
+				return "person"
+			}
+			fieldTypeRe2 := regexp.MustCompile(`(?i)\*\*(channel|platform)\*\*:\s*` + regexp.QuoteMeta(name))
+			if fieldTypeRe2.MatchString(content) {
+				return "channel"
+			}
+		}
+
+		// Fallback: check if name is surrounded by person-like context
+		personHints := []string{"he ", "she ", "his ", "her ", "mr.", "mrs.", "dr."}
+		for _, hint := range personHints {
+			if strings.Contains(contentLower, strings.ToLower(name)+" "+hint) ||
+				strings.Contains(contentLower, hint+strings.ToLower(name)) {
+				return "person"
+			}
+		}
+	}
+
+	// Default
+	return "concept"
 }
