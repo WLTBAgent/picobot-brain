@@ -201,8 +201,28 @@ func (b *Brain) Maintain(ctx context.Context) (*MaintainReport, error) {
 		}
 	}
 
-	// Phase 2: Extract entities from unprocessed pages (Phase 3 — stub for now)
-	// Entity extraction regex patterns will be added in Phase 3
+	// Phase 2: Extract entities from unprocessed pages
+	entityRows, err := b.db.Query(`
+		SELECT p.id FROM pages p
+		WHERE p.content != ''
+		ORDER BY p.id`)
+	if err == nil {
+		var pageIDs []int64
+		for entityRows.Next() {
+			var pid int64
+			if entityRows.Scan(&pid) == nil {
+				pageIDs = append(pageIDs, pid)
+			}
+		}
+		entityRows.Close()
+
+		for _, pid := range pageIDs {
+			n, err := b.ExtractEntities(ctx, pid)
+			if err == nil {
+				report.EntitiesExtracted += n
+			}
+		}
+	}
 
 	// Phase 3: Rebuild stale FTS entries
 	rows, err := b.db.Query(`SELECT COUNT(*) FROM pages WHERE id NOT IN (SELECT rowid FROM pages_fts)`)

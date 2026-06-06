@@ -19,10 +19,23 @@ var (
 	emailRe = regexp.MustCompile(`[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}`)
 
 	// "works at X", "CEO of X", "founded X" — relationship patterns
-	worksAtRe = regexp.MustCompile(`(?i)(?:works?\s+at|employed\s+by|joined)\s+([A-Z][A-Za-z0-9&\s]{1,40})`)
-	ceoOfRe   = regexp.MustCompile(`(?i)(?:CEO|CTO|CFO|COO|founder|co-founder)\s+(?:of\s+)?([A-Z][A-Za-z0-9&\s]{1,40})`)
+	worksAtRe  = regexp.MustCompile(`(?i)(?:works?\s+at|employed\s+by|joined)\s+([A-Z][A-Za-z0-9&\s]{1,40})`)
+	ceoOfRe    = regexp.MustCompile(`(?i)(?:CEO|CTO|CFO|COO|founder|co-founder)\s+(?:of\s+)?([A-Z][A-Za-z0-9&\s]{1,40})`)
 	investedRe = regexp.MustCompile(`(?i)(?:invested\s+in|funded|backed)\s+([A-Z][A-Za-z0-9&\s]{1,40})`)
 	attendedRe = regexp.MustCompile(`(?i)(?:attended|present\s+at|spoke\s+at)\s+([A-Z][A-Za-z0-9&\s]{1,50})`)
+
+	// Markdown structured fields: "- **Key**: Value" patterns
+	// Matches lines like: - **Name**: Josh  or  - **Company**: Acme Corp
+	markdownFieldRe = regexp.MustCompile(`(?i)^[\-\*]\s+\*\*(?:name|company|organization|project|channel|role|title|location|city|country|employer|school|university|team|group|department|product|brand|app|tool|framework|language|platform)\*\*:\s*(.+)$`)
+
+	// Section headers as concept entities: "## Project X" or "### Tool Y"
+	sectionHeaderRe = regexp.MustCompile(`^#{2,3}\s+([A-Z][A-Za-z0-9\s&\-]{2,50})$`)
+
+	// Bold references in running text: **ThingName**
+	boldRefRe = regexp.MustCompile(`\*\*([A-Z][A-Za-z0-9&\s]{2,40})\*\*`)
+
+	// Parenthetical descriptions: Name (Type) — like "WLTechBlog (YouTube)"
+	parenTypeRe = regexp.MustCompile(`([A-Z][A-Za-z0-9\s]{2,30})\s*\((YouTube|GitHub|Twitter|Discord|Telegram|Google|Apple|Microsoft|Amazon|AWS|Linux|Debian|Ubuntu|Go|Python|Rust|JavaScript|TypeScript)\)`)
 )
 
 // ExtractEntities scans a page for entity references and creates entities/edges.
@@ -62,6 +75,64 @@ func (b *Brain) ExtractEntities(ctx context.Context, pageID int64) (int, error) 
 	created += b.extractRelationships(ctx, page.SourceID, pageID, content, ceoOfRe, "leads")
 	created += b.extractRelationships(ctx, page.SourceID, pageID, content, investedRe, "invested_in")
 	created += b.extractRelationships(ctx, page.SourceID, pageID, content, attendedRe, "attended")
+
+	// Extract structured markdown fields: - **Key**: Value
+	fieldMatches := markdownFieldRe.FindAllStringSubmatch(content, -1)
+	for _, m := range fieldMatches {
+		value := strings.TrimSpace(m[1])
+		// Remove trailing punctuation
+		value = strings.TrimRight(value, ".,;")
+		if len(value) < 1 || len(value) > 60 {
+			continue
+		}
+		entityType := inferEntityType(value, content)
+		slug := slugify(entityType) + "/" + slugify(value)
+		if _, err := b.ensureEntity(ctx, page.SourceID, value, entityType, slug, &pageID); err == nil {
+			created++
+		}
+	}
+
+	// Extract parenthetical typed entities: Name (Type)
+	parenMatches := parenTypeRe.FindAllStringSubmatch(content, -1)
+	for _, m := range parenMatches {
+		name := strings.TrimSpace(m[1])
+		parentType := strings.ToLower(m[2])
+		entityType := "concept"
+		switch parentType {
+		case "youtube", "github", "twitter", "discord", "telegram":
+			entityType = "channel"
+		case "google", "apple", "microsoft", "amazon", "aws":
+			entityType = "company"
+		case "linux", "debian", "ubuntu":
+			entityType = "platform"
+		case "go", "python", "rust", "javascript", "typescript":
+			entityType = "language"
+		}
+		slug := slugify(entityType) + "/" + slugify(name)
+		if _, err := b.ensureEntity(ctx, page.SourceID, name, entityType, slug, &pageID); err == nil {
+			created++
+		}
+	}
+
+	// Extract bold references (only unique, significant ones)
+	boldMatches := boldRefRe.FindAllStringSubmatch(content, -1)
+	seen := map[string]bool{}
+	for _, m := range boldMatches {
+		name := strings.TrimSpace(m[1])
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		// Skip common words and short names
+		if len(name) < 3 {
+			continue
+		}
+		entityType := inferEntityType(name, content)
+		slug := slugify(entityType) + "/" + slugify(name)
+		if _, err := b.ensureEntity(ctx, page.SourceID, name, entityType, slug, &pageID); err == nil {
+			created++
+		}
+	}
 
 	return created, nil
 }
@@ -247,13 +318,24 @@ func (b *Brain) getEntityByID(ctx context.Context, id int64) (*Entity, error) {
 
 // inferEntityType guesses entity type from name context.
 func inferEntityType(name, content string) string {
-	lower := strings.ToLower(content)
+	lower := strings.ToLower(name + " " + content)
 	switch {
-	case strings.ContainsAny(lower, "company corp inc llc ltd"):
+	case strings.Contains(lower, "company") || strings.Contains(lower, "corp") ||
+		strings.Contains(lower, "inc") || strings.Contains(lower, "llc") ||
+		strings.Contains(lower, "ltd") || strings.Contains(lower, "youtube") ||
+		strings.Contains(lower, "google") || strings.Contains(lower, "github"):
 		return "company"
-	case strings.ContainsAny(lower, "conference summit meetup event"):
+	case strings.Contains(lower, "conference") || strings.Contains(lower, "summit") ||
+		strings.Contains(lower, "meetup") || strings.Contains(lower, "event"):
 		return "event"
+	case strings.Contains(lower, "project") || strings.Contains(lower, "repo") ||
+		strings.Contains(lower, "bot") || strings.Contains(lower, "agent") ||
+		strings.Contains(lower, "framework") || strings.Contains(lower, "tool"):
+		return "project"
+	case strings.Contains(lower, "channel") || strings.Contains(lower, "video") ||
+		strings.Contains(lower, "blog") || strings.Contains(lower, "creator"):
+		return "channel"
 	default:
-		return "person"
+		return "concept"
 	}
 }
